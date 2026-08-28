@@ -1,8 +1,12 @@
-import { render, screen } from '@testing-library/react';
-import App from './App';
+import { render, screen } from "@testing-library/react";
+import App from "./App";
 
-test('renders learn react link', () => {
+test("renders dashboard or setup guidance", () => {
   render(<App />);
-  const linkElement = screen.getByText(/learn react/i);
-  expect(linkElement).toBeInTheDocument();
+
+  const expectedElement =
+    screen.queryByText(/road accident risk heatmap/i) ||
+    screen.queryByText(/missing react_app_google_maps_api_key/i);
+
+  expect(expectedElement).toBeInTheDocument();
 });

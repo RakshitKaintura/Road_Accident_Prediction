@@ -1,7 +1,7 @@
 import joblib
+from pathlib import Path
 
-MODEL_PATH = "model/xgb_severe_model.pkl"
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "model" / "xgb_model.pkl"
+
 model = joblib.load(MODEL_PATH)
-
-def predict_proba(features_df):
-    return model.predict_proba(features_df)[:, 1]

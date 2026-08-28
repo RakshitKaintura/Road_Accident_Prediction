@@ -1,104 +1,79 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-import joblib
-import requests
-import os
+from __future__ import annotations
+
 from datetime import datetime
 
-from config import OPENWEATHER_API_KEY, TOMTOM_API_KEY
+import requests
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
-# ---------------- APP SETUP ----------------
-app = FastAPI()
+from backend.api.heatmap_routes import router as heatmap_router
+from backend.config import BACKEND_CORS_ORIGINS, CACHE_TTL_SECONDS, RISK_THRESHOLD
+from backend.external_clients import (
+    ExternalDataError,
+    fetch_traffic_stress,
+    fetch_weather,
+    validate_external_keys,
+)
+from backend.features import build_dataframe, build_features
+from backend.model import model
+from backend.schemas import HealthResponse, PredictResponse
 
+THRESHOLD = RISK_THRESHOLD
+
+app = FastAPI(
+    title="Road Accident Risk API",
+    description="Predict road accident severity risk and generate city heatmaps.",
+    version="1.1.0",
+)
+app.include_router(heatmap_router)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=BACKEND_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------------- LOAD MODEL ----------------
-BASE_DIR = os.path.dirname(__file__)
-model = joblib.load(os.path.join(BASE_DIR, "model", "xgb_model.pkl"))
 
-THRESHOLD = 0.35  # tuned for recall
-
-# ---------------- PREDICTION API ----------------
-@app.get("/predict")
-def predict(lat: float, lon: float):
-
-    # -------- Weather API --------
-    w = requests.get(
-        "https://api.openweathermap.org/data/2.5/weather",
-        params={
-            "lat": lat,
-            "lon": lon,
-            "appid": OPENWEATHER_API_KEY,
-            "units": "metric",
-        },
-        timeout=10,
-    ).json()
-
-    # -------- Traffic API --------
-    t = requests.get(
-        "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json",
-        params={
-            "point": f"{lat},{lon}",
-            "key": TOMTOM_API_KEY,
-        },
-        timeout=10,
-    ).json()
-
-    # -------- Defensive Checks --------
-    if "main" not in w or "flowSegmentData" not in t:
-        return {"error": "External API failure"}
-
-    # -------- Feature Engineering (INFERENCE) --------
-    temp = w["main"]["temp"]
-    visibility = w.get("visibility", 0)
-    rain = 1 if "rain" in w else 0
-
-    speed = t["flowSegmentData"]["currentSpeed"]
-    free_flow = max(t["flowSegmentData"]["freeFlowSpeed"], 1)
-
-    # Traffic stress (same as training)
-    traffic_stress = max(0, min(1, 1 - (speed / free_flow)))
-
-    # ⚠️ NOTE:
-    # Features like time, road structure, accident_density
-    # are learned historically by the model.
-    # At inference, we pass only dynamic features.
-    now = datetime.now()
-
-    hour = now.hour
-    day_of_week = now.weekday()
-    month = now.month
-
-    is_weekend = int(day_of_week >= 5)
-    is_night = int(hour >= 20 or hour <= 5)
-    is_rush_hour = int(hour in [7,8,9,16,17,18])
-
-    X = [[
-    temp,
-    visibility,
-    rain,
-    traffic_stress,
-    hour,
-    day_of_week,
-    month,
-    is_weekend,
-    is_night,
-    is_rush_hour
-]]
+@app.get("/health", response_model=HealthResponse, tags=["system"])
+def health() -> HealthResponse:
+    return HealthResponse(
+        status="ok",
+        generated_at=datetime.utcnow(),
+        model_loaded=model is not None,
+        cache_ttl_seconds=CACHE_TTL_SECONDS,
+    )
 
 
-    # -------- Prediction --------
-    proba = model.predict_proba(X)[0][1]
+@app.get("/predict", response_model=PredictResponse, tags=["prediction"])
+def predict(
+    lat: float = Query(..., ge=-90, le=90, description="Latitude"),
+    lon: float = Query(..., ge=-180, le=180, description="Longitude"),
+) -> PredictResponse:
+    try:
+        validate_external_keys()
+        weather = fetch_weather(lat, lon)
+        traffic_stress = fetch_traffic_stress(lat, lon)
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"External API request failed: {exc}") from exc
+    except ExternalDataError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    row = build_features(
+        lat=lat,
+        lon=lon,
+        weather=weather,
+        traffic_stress=traffic_stress,
+        accident_density=0.3,
+    )
+    proba = float(model.predict_proba(build_dataframe([row]))[0][1])
     severe_risk = int(proba > THRESHOLD)
 
-    return {
-        "severe_risk": severe_risk,
-        "probability": round(float(proba), 3),
-        "threshold": THRESHOLD
-    }
+    risk_label = "High" if proba >= 0.7 else "Medium" if proba >= THRESHOLD else "Low"
+
+    return PredictResponse(
+        severe_risk=severe_risk,
+        probability=round(proba, 3),
+        threshold=THRESHOLD,
+        risk_label=risk_label,
+    )

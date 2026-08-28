@@ -1,13 +1,5 @@
 import numpy as np
-
-NYC_BOUNDS = {
-    "lat_min": 40.49,
-    "lat_max": 40.92,
-    "lon_min": -74.27,
-    "lon_max": -73.68
-}
-
-GRID_RESOLUTION = 0.003  # ~300m
+from backend.config import GRID_RESOLUTION, NYC_BOUNDS
 
 def generate_city_grid():
     lat_vals = np.arange(
